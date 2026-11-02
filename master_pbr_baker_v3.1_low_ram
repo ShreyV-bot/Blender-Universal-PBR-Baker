@@ -4,25 +4,23 @@ import gc
 import re
 
 # ==============================================================================
-# --- CRASH-PROOF LOW-RAM CONFIGURATION (v3.1 - Correlated Micro-Flake Fix) ---
+# --- CRASH-PROOF LOW-RAM CONFIGURATION (v3.1 - 63-Char & Linear Roughness Fix) ---
 # ==============================================================================
 SAVE_PATH = r"C:\Users\hp\OneDrive\Desktop\Portfolio_2.O\Baked_Images"
 
-IMAGE_SIZE = 2048          # Use 2048 for fast low-RAM baking (4096 for ultra-fine flakes)
+IMAGE_SIZE = 2048          # 2048 for fast, low-RAM baking (use 4096 for hero assets)
 UV_ISLAND_MARGIN = 0.006   # Safe spacing between UV islands
 CLEANUP_NODES = True       # Replaces complex nodes with clean Principled BSDF
-UV_STRATEGY = 'AUTO'       # Preserves clean 0-1 UVs; unwraps if tiled/overlapping
+UV_STRATEGY = 'AUTO'       # Smart 0-1 UV check + non-overlapping pack
 MAX_CPU_THREADS = 8        # Leaves threads free so Windows & Blender UI never freeze
 
-ONLY_LINK_SPATIALLY_VARYING_MAPS = True
-SAVE_CONSTANT_MAPS_TO_DISK = True
+# When True, bakes all channels; when False, keeps unlinked solid sliders as exact sliders
+FORCE_BAKE_ALL_MAPS = True 
 
 CHANNELS_TO_BAKE = [
     'BASE_COLOR', 
     'METALLIC', 
     'ROUGHNESS', 
-    'COAT_WEIGHT',
-    'COAT_ROUGHNESS',
     'TRANSMISSION',
     'NORMAL', 
     'ALPHA', 
@@ -32,10 +30,12 @@ CHANNELS_TO_BAKE = [
 # ==============================================================================
 
 def sanitize_filename(text, max_len=45):
+    """Cleans illegal path characters and caps length so filenames never truncate."""
     clean = re.sub(r'[\\/*?:"<>|]', "_", text).strip()
     return clean[:max_len].strip()
 
 def get_3d_view_context():
+    """Finds a valid Window, Area, and WINDOW Region for VIEW_3D."""
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
@@ -45,6 +45,7 @@ def get_3d_view_context():
     return None
 
 def set_viewports_to_solid():
+    """Switches all 3D Viewports to SOLID mode during baking to prevent GPU driver crashes."""
     saved_shading = []
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
@@ -95,6 +96,7 @@ def make_node_groups_single_user(nt, visited=None):
             make_node_groups_single_user(node.node_tree, visited)
 
 def optimize_raytraced_nodes(node_tree, visited=None):
+    """Lowers AO/Bevel samples to 4 and enables 'Only Local' for 10x faster raytracing."""
     if visited is None:
         visited = set()
     if node_tree in visited:
@@ -118,6 +120,7 @@ def optimize_raytraced_nodes(node_tree, visited=None):
     return has_ray_nodes
 
 def lock_original_uv_references(node_tree, orig_uv_name, visited=None):
+    """Explicitly anchors all UV-dependent shader nodes to orig_uv_name."""
     if visited is None:
         visited = set()
     if node_tree in visited:
@@ -179,6 +182,7 @@ def setup_bake_uvs_guaranteed(obj, orig_uv_name):
     mesh = obj.data
     has_orig = orig_uv_name is not None
 
+    # Make single-user mesh if shared with other objects (like Left/Right doors or handles)
     if mesh.users > 1:
         obj.data = mesh.copy()
         mesh = obj.data
@@ -236,85 +240,7 @@ def setup_bake_uvs_guaranteed(obj, orig_uv_name):
 
     force_normalize_uv_bounds_python(mesh, "Bake_UV", margin=UV_ISLAND_MARGIN)
 
-def detect_clearcoat_glossy_mix(surface_node):
-    """
-    Detects a `Mix Shader` blending a `Principled BSDF` with a `Glossy BSDF` (like Image 3).
-    Returns `(base_principled_node, glossy_node, fac_socket, glossy_is_socket_1)`.
-    """
-    if not surface_node or surface_node.type != 'MIX_SHADER':
-        return None
-
-    fac_sock = surface_node.inputs[0]
-    s1_sock = surface_node.inputs[1]
-    s2_sock = surface_node.inputs[2]
-
-    s1 = s1_sock.links[0].from_node if s1_sock.is_linked else None
-    s2 = s2_sock.links[0].from_node if s2_sock.is_linked else None
-
-    if not s1 or not s2:
-        return None
-
-    if s1.type == 'BSDF_PRINCIPLED' and s2.type in {'BSDF_GLOSSY', 'BSDF_ANISOTROPIC'}:
-        return (s1, s2, fac_sock, False)
-    if s2.type == 'BSDF_PRINCIPLED' and s1.type in {'BSDF_GLOSSY', 'BSDF_ANISOTROPIC'}:
-        return (s2, s1, fac_sock, True)
-
-    return None
-
-def prepare_normal_bake_override(nt, surface_node, temp_cleanup_records):
-    """
-    CRITICAL FIX FOR IMAGE 3 (Metallic Paint Camo):
-    In Image 3, the `Mix Shader` has `Glossy BSDF` in Socket 1 (top) and `Principled BSDF` 
-    in Socket 2 (bottom), controlled by `Fresnel (IOR=1.470)`.
-    At straight-on bake rays (`Fresnel = 0.036`), Cycles evaluates 96.4% of Socket 1 (`Glossy BSDF`),
-    completely ignoring the `Principled BSDF`'s bump map during a `NORMAL` bake!
-    Even better: we chain BOTH Bump maps (`Glossy` Bump + `Principled` Bump) into the `Principled BSDF` 
-    and route the `Principled BSDF` directly to the output during the `NORMAL` bake!
-    """
-    if not surface_node:
-        return
-
-    if surface_node.type == 'GROUP' and surface_node.node_tree:
-        inner_nt = surface_node.node_tree
-        g_out = get_active_group_output(inner_nt.nodes)
-        if g_out:
-            shader_in = next((s for s in g_out.inputs if s.type == 'SHADER' and s.is_linked), None)
-            if shader_in:
-                orig_from = shader_in.links[0].from_socket
-                inner_surf = orig_from.node
-                cc_match = detect_clearcoat_glossy_mix(inner_surf)
-                if cc_match:
-                    base_bsdf, glossy_bsdf, _, _ = cc_match
-                    # If both Glossy and Principled have Bump nodes (like Image 3), chain them together!
-                    g_norm = glossy_bsdf.inputs.get('Normal')
-                    p_norm = base_bsdf.inputs.get('Normal')
-                    if g_norm and g_norm.is_linked and p_norm and p_norm.is_linked:
-                        p_bump = p_norm.links[0].from_node
-                        if p_bump.type == 'BUMP' and not p_bump.inputs['Normal'].is_linked:
-                            inner_nt.links.new(g_norm.links[0].from_socket, p_bump.inputs['Normal'])
-                            temp_cleanup_records.append(('REMOVE_LINK', inner_nt, g_norm.links[0].from_socket, p_bump.inputs['Normal']))
-                    # Route base_bsdf directly to Group Output during NORMAL pass so 100% of flake normal bakes!
-                    inner_nt.links.new(base_bsdf.outputs['BSDF'], shader_in)
-                    temp_cleanup_records.append(('RESTORE_LINK', inner_nt, orig_from, shader_in))
-        return
-
-    cc_match = detect_clearcoat_glossy_mix(surface_node)
-    if cc_match:
-        base_bsdf, glossy_bsdf, _, _ = cc_match
-        out_node = get_active_output(nt.nodes)
-        if out_node and out_node.inputs['Surface'].is_linked:
-            orig_from = out_node.inputs['Surface'].links[0].from_socket
-            g_norm = glossy_bsdf.inputs.get('Normal')
-            p_norm = base_bsdf.inputs.get('Normal')
-            if g_norm and g_norm.is_linked and p_norm and p_norm.is_linked:
-                p_bump = p_norm.links[0].from_node
-                if p_bump.type == 'BUMP' and not p_bump.inputs['Normal'].is_linked:
-                    nt.links.new(g_norm.links[0].from_socket, p_bump.inputs['Normal'])
-                    temp_cleanup_records.append(('REMOVE_LINK', nt, g_norm.links[0].from_socket, p_bump.inputs['Normal']))
-            nt.links.new(base_bsdf.outputs['BSDF'], out_node.inputs['Surface'])
-            temp_cleanup_records.append(('RESTORE_LINK', nt, orig_from, out_node.inputs['Surface']))
-
-def is_channel_spatially_varying(nt, surface_node, channel, parent_group_node=None):
+def is_channel_linked_recursive(nt, surface_node, channel):
     if not surface_node:
         return False
 
@@ -323,68 +249,26 @@ def is_channel_spatially_varying(nt, surface_node, channel, parent_group_node=No
         if g_out:
             shader_in = next((s for s in g_out.inputs if s.type == 'SHADER' and s.is_linked), None)
             if shader_in:
-                return is_channel_spatially_varying(
-                    surface_node.node_tree, 
-                    shader_in.links[0].from_node, 
-                    channel, 
-                    parent_group_node=surface_node
-                )
+                return is_channel_linked_recursive(surface_node.node_tree, shader_in.links[0].from_node, channel)
         return False
-
-    cc_match = detect_clearcoat_glossy_mix(surface_node)
-    if cc_match:
-        base_bsdf, glossy_bsdf, _, _ = cc_match
-        if channel in {'COAT_WEIGHT', 'COAT_ROUGHNESS'}:
-            return False
-        return is_channel_spatially_varying(nt, base_bsdf, channel, parent_group_node)
-
-    socket_names = {
-        'BASE_COLOR':     ['Base Color', 'Color'],
-        'METALLIC':       ['Metallic'],
-        'ROUGHNESS':      ['Roughness'],
-        'COAT_WEIGHT':    ['Coat Weight', 'Clearcoat'],
-        'COAT_ROUGHNESS': ['Coat Roughness', 'Clearcoat Roughness'],
-        'TRANSMISSION':   ['Transmission Weight', 'Transmission'],
-        'NORMAL':         ['Normal'],
-        'ALPHA':          ['Alpha'],
-        'SPECULAR':       ['Specular IOR Level', 'Specular'],
-        'EMISSION':       ['Emission Color', 'Emission'],
-    }.get(channel, [])
 
     if surface_node.type in {'MIX_SHADER', 'ADD_SHADER'}:
-        s1_sock = surface_node.inputs[1] if surface_node.type == 'MIX_SHADER' else surface_node.inputs[0]
-        s2_sock = surface_node.inputs[2] if surface_node.type == 'MIX_SHADER' else surface_node.inputs[1]
-        s1 = s1_sock.links[0].from_node if s1_sock.is_linked else None
-        s2 = s2_sock.links[0].from_node if s2_sock.is_linked else None
+        return True
 
-        if is_channel_spatially_varying(nt, s1, channel, parent_group_node) or is_channel_spatially_varying(nt, s2, channel, parent_group_node):
-            return True
-
-        if s1 and s2 and s1.type == 'BSDF_PRINCIPLED' and s2.type == 'BSDF_PRINCIPLED':
-            sock1 = get_socket(s1, socket_names)
-            sock2 = get_socket(s2, socket_names)
-            if sock1 and sock2:
-                v1 = sock1.default_value
-                v2 = sock2.default_value
-                if hasattr(v1, '__len__'):
-                    if any(abs(a - b) > 1e-3 for a, b in zip(v1, v2)):
-                        return True
-                elif abs(v1 - v2) > 1e-3:
-                    return True
-        return False
+    socket_names = {
+        'BASE_COLOR':   ['Base Color', 'Color'],
+        'METALLIC':     ['Metallic'],
+        'ROUGHNESS':    ['Roughness'],
+        'TRANSMISSION': ['Transmission Weight', 'Transmission'],
+        'NORMAL':       ['Normal'],
+        'ALPHA':        ['Alpha'],
+        'SPECULAR':     ['Specular IOR Level', 'Specular'],
+        'EMISSION':     ['Emission Color', 'Emission'],
+    }.get(channel, [])
 
     sock = get_socket(surface_node, socket_names)
     if sock and sock.is_linked:
-        from_node = sock.links[0].from_node
-        if from_node.type in {'VALUE', 'RGB'}:
-            return False
-        if from_node.type == 'GROUP_INPUT' and parent_group_node:
-            from_name = sock.links[0].from_socket.name
-            ext_sock = parent_group_node.inputs.get(from_name)
-            if ext_sock and not ext_sock.is_linked:
-                return False
         return True
-
     if channel == 'EMISSION':
         str_sock = get_socket(surface_node, ['Emission Strength'])
         if str_sock and str_sock.is_linked:
@@ -392,6 +276,9 @@ def is_channel_spatially_varying(nt, surface_node, channel, parent_group_node=No
     return False
 
 def build_channel_emission_shader(nt, surface_node, channel, temp_cleanup_records):
+    """
+    Constructs a temporary Emission Shader outputting the exact linear value of `channel`.
+    """
     if not surface_node:
         return None
 
@@ -421,21 +308,14 @@ def build_channel_emission_shader(nt, surface_node, channel, temp_cleanup_record
         temp_cleanup_records.append(('REMOVE_NODE', nt, n, None))
         return n
 
-    cc_match = detect_clearcoat_glossy_mix(surface_node)
-    if cc_match:
-        base_bsdf, glossy_bsdf, _, _ = cc_match
-        return build_channel_emission_shader(nt, base_bsdf, channel, temp_cleanup_records)
-
     socket_map = {
-        'BASE_COLOR':     (['Base Color', 'Color'], 'RGBA', (0.8, 0.8, 0.8, 1.0)),
-        'METALLIC':       (['Metallic'], 'VALUE', 0.0),
-        'ROUGHNESS':      (['Roughness'], 'VALUE', 0.5),
-        'COAT_WEIGHT':    (['Coat Weight', 'Clearcoat'], 'VALUE', 0.0),
-        'COAT_ROUGHNESS': (['Coat Roughness', 'Clearcoat Roughness'], 'VALUE', 0.03),
-        'TRANSMISSION':   (['Transmission Weight', 'Transmission'], 'VALUE', 0.0),
-        'ALPHA':          (['Alpha'], 'VALUE', 1.0),
-        'SPECULAR':       (['Specular IOR Level', 'Specular'], 'VALUE', 0.5),
-        'EMISSION':       (['Emission Color', 'Emission'], 'RGBA', (0.0, 0.0, 0.0, 1.0)),
+        'BASE_COLOR':   (['Base Color', 'Color'], 'RGBA', (0.8, 0.8, 0.8, 1.0)),
+        'METALLIC':     (['Metallic'], 'VALUE', 0.0),
+        'ROUGHNESS':    (['Roughness'], 'VALUE', 0.5),
+        'TRANSMISSION': (['Transmission Weight', 'Transmission'], 'VALUE', 0.0),
+        'ALPHA':        (['Alpha'], 'VALUE', 1.0),
+        'SPECULAR':     (['Specular IOR Level', 'Specular'], 'VALUE', 0.5),
+        'EMISSION':     (['Emission Color', 'Emission'], 'RGBA', (0.0, 0.0, 0.0, 1.0)),
     }
 
     val_socket = None
@@ -456,10 +336,6 @@ def build_channel_emission_shader(nt, surface_node, channel, temp_cleanup_record
 
             if sock.is_linked:
                 val_socket = sock.links[0].from_socket
-                # CRITICAL FIX FOR IMAGE 3 (Roughness > 1.0 clamping):
-                # In Image 3, Roughness is multiplied by 1.450 (`Clamp = False`), which makes 85% of the Voronoi 
-                # flakes super-matte (>= 1.0) in the original shader! If we don't clamp or preserve that curve, 
-                # or if Base Color is darkened by Voronoi, we must output the exact socket value!
             elif sock_type == 'RGBA':
                 rgb_node = make_temp_node('ShaderNodeRGB')
                 rgb_node.outputs[0].default_value = sock.default_value
@@ -557,12 +433,7 @@ def build_channel_emission_shader(nt, surface_node, channel, temp_cleanup_record
     return None
 
 def capture_all_principled_scalars(nt, visited=None):
-    """
-    Captures all scalar and color settings across Principled BSDFs.
-    CRITICAL FIX FOR IMAGE 1 vs IMAGE 3:
-    Does NOT artificially set Coat Weight = 1.0 when Glossy BSDF is mixed with Fresnel
-    if the Principled BSDF itself had Coat Weight = 0.0 (which caused a bright white haze over the camo!).
-    """
+    """Captures all unlinked scalar and color settings from the original Principled BSDF."""
     if visited is None:
         visited = set()
     if nt in visited:
@@ -581,22 +452,14 @@ def capture_all_principled_scalars(nt, visited=None):
         'Emission Color': (0.0, 0.0, 0.0, 1.0),
         'Coat Weight': 0.0,
         'Coat Roughness': 0.03,
-        'Coat IOR': 1.5,
-        'Coat Tint': (1.0, 1.0, 1.0, 1.0),
         'Sheen Weight': 0.0,
         'Sheen Roughness': 0.5,
     }
 
-    found_first_bsdf = False
-
     for n in nt.nodes:
         if n.type == 'GROUP' and n.node_tree:
             sub_props = capture_all_principled_scalars(n.node_tree, visited)
-            for k, v in sub_props.items():
-                if k in {'Coat Weight', 'Sheen Weight', 'Transmission', 'Emission Strength', 'Metallic'}:
-                    props[k] = max(props.get(k, 0.0), v)
-                else:
-                    props[k] = v
+            props.update(sub_props)
             for inp in n.inputs:
                 uname = inp.name.upper()
                 if not inp.is_linked:
@@ -610,57 +473,44 @@ def capture_all_principled_scalars(nt, visited=None):
                         props['Roughness'] = inp.default_value
 
         elif n.type == 'BSDF_PRINCIPLED':
-            if not found_first_bsdf:
-                found_first_bsdf = True
-                if 'IOR' in n.inputs:
-                    props['IOR'] = n.inputs['IOR'].default_value
-                bc = get_socket(n, ['Base Color'])
-                if bc:
-                    props['Base Color'] = tuple(bc.default_value)
-                met = get_socket(n, ['Metallic'])
-                if met:
-                    props['Metallic'] = met.default_value
-                rough = get_socket(n, ['Roughness'])
-                if rough:
-                    props['Roughness'] = rough.default_value
-                spec = get_socket(n, ['Specular IOR Level', 'Specular'])
-                if spec:
-                    props['Specular'] = spec.default_value
-                alpha = get_socket(n, ['Alpha'])
-                if alpha:
-                    props['Alpha'] = alpha.default_value
-
+            if 'IOR' in n.inputs:
+                props['IOR'] = n.inputs['IOR'].default_value
+            bc = get_socket(n, ['Base Color'])
+            if bc:
+                props['Base Color'] = tuple(bc.default_value)
             met = get_socket(n, ['Metallic'])
-            if met and not met.is_linked:
-                props['Metallic'] = max(props['Metallic'], met.default_value)
-
+            if met:
+                props['Metallic'] = met.default_value
+            rough = get_socket(n, ['Roughness'])
+            if rough:
+                props['Roughness'] = rough.default_value
+            spec = get_socket(n, ['Specular IOR Level', 'Specular'])
+            if spec:
+                props['Specular'] = spec.default_value
+            alpha = get_socket(n, ['Alpha'])
+            if alpha:
+                props['Alpha'] = alpha.default_value
             t_sock = get_socket(n, ['Transmission Weight', 'Transmission'])
             if t_sock and not t_sock.is_linked:
                 props['Transmission'] = max(props['Transmission'], t_sock.default_value)
-
             ec = get_socket(n, ['Emission Color', 'Emission'])
+            if ec:
+                props['Emission Color'] = tuple(ec.default_value)
             es = get_socket(n, ['Emission Strength'])
-            if es and es.default_value > props['Emission Strength']:
+            if es:
                 props['Emission Strength'] = es.default_value
-                if ec:
-                    props['Emission Color'] = tuple(ec.default_value)
-
             cw = get_socket(n, ['Coat Weight', 'Clearcoat'])
-            if cw and cw.default_value > props['Coat Weight']:
+            if cw:
                 props['Coat Weight'] = cw.default_value
-                cr = get_socket(n, ['Coat Roughness', 'Clearcoat Roughness'])
-                if cr:
-                    props['Coat Roughness'] = cr.default_value
-                cior = get_socket(n, ['Coat IOR'])
-                if cior:
-                    props['Coat IOR'] = cior.default_value
-
+            cr = get_socket(n, ['Coat Roughness', 'Clearcoat Roughness'])
+            if cr:
+                props['Coat Roughness'] = cr.default_value
             sw = get_socket(n, ['Sheen Weight', 'Sheen'])
-            if sw and sw.default_value > props['Sheen Weight']:
+            if sw:
                 props['Sheen Weight'] = sw.default_value
-                sr = get_socket(n, ['Sheen Roughness'])
-                if sr:
-                    props['Sheen Roughness'] = sr.default_value
+            sr = get_socket(n, ['Sheen Roughness'])
+            if sr:
+                props['Sheen Roughness'] = sr.default_value
 
         elif n.type in {'BSDF_GLASS', 'BSDF_REFRACTION'}:
             if 'IOR' in n.inputs:
@@ -679,12 +529,6 @@ def get_background_fill_color(channel, scalar_props):
     elif channel == 'METALLIC':
         m = scalar_props.get('Metallic', 0.0)
         return (m, m, m, 1.0)
-    elif channel == 'COAT_WEIGHT':
-        cw = scalar_props.get('Coat Weight', 0.0)
-        return (cw, cw, cw, 1.0)
-    elif channel == 'COAT_ROUGHNESS':
-        cr = scalar_props.get('Coat Roughness', 0.03)
-        return (cr, cr, cr, 1.0)
     elif channel == 'NORMAL':
         return (0.5, 0.5, 1.0, 1.0)
     elif channel == 'EMISSION':
@@ -713,49 +557,20 @@ def should_bake_channel_recursive(nt, surface_node, channel):
                 return should_bake_channel_recursive(surface_node.node_tree, shader_in.links[0].from_node, channel)
         return False
 
-    cc_match = detect_clearcoat_glossy_mix(surface_node)
-    if cc_match:
-        base_bsdf, _, _, _ = cc_match
-        if channel in {'COAT_WEIGHT', 'COAT_ROUGHNESS'}:
-            return False
-        return should_bake_channel_recursive(nt, base_bsdf, channel)
-
     if surface_node.type in {'MIX_SHADER', 'ADD_SHADER'}:
-        if channel in ['METALLIC', 'ROUGHNESS', 'BASE_COLOR', 'NORMAL']:
-            return True
-        if channel == 'COAT_WEIGHT':
-            return any(
-                n.type == 'BSDF_PRINCIPLED' and get_socket(n, ['Coat Weight', 'Clearcoat']) and 
-                (get_socket(n, ['Coat Weight', 'Clearcoat']).is_linked or get_socket(n, ['Coat Weight', 'Clearcoat']).default_value > 0.001)
-                for n in nt.nodes
-            )
-        if channel == 'COAT_ROUGHNESS':
-            return any(
-                n.type == 'BSDF_PRINCIPLED' and get_socket(n, ['Coat Roughness', 'Clearcoat Roughness']) and 
-                get_socket(n, ['Coat Roughness', 'Clearcoat Roughness']).is_linked
-                for n in nt.nodes
-            )
-        if channel == 'SPECULAR':
-            return any(
-                n.type == 'BSDF_PRINCIPLED' and get_socket(n, ['Specular IOR Level', 'Specular']) and 
-                get_socket(n, ['Specular IOR Level', 'Specular']).is_linked
-                for n in nt.nodes
-            )
-        return False
+        return channel in ['METALLIC', 'ROUGHNESS', 'BASE_COLOR', 'NORMAL']
 
     if surface_node.type == 'BSDF_PRINCIPLED':
         if channel == 'METALLIC':
             s = get_socket(surface_node, ['Metallic'])
             return s and (s.is_linked or s.default_value > 0.001)
-        if channel == 'COAT_WEIGHT':
-            s = get_socket(surface_node, ['Coat Weight', 'Clearcoat'])
-            return s and s.is_linked
-        if channel == 'COAT_ROUGHNESS':
-            s = get_socket(surface_node, ['Coat Roughness', 'Clearcoat Roughness'])
-            return s and s.is_linked
         if channel == 'TRANSMISSION':
             s = get_socket(surface_node, ['Transmission Weight', 'Transmission'])
-            return s and s.is_linked and s.links[0].from_node.type != 'GROUP_INPUT'
+            if not s or not s.is_linked:
+                return False
+            if s.links[0].from_node.type == 'GROUP_INPUT':
+                return False
+            return True
         if channel == 'ALPHA':
             s = get_socket(surface_node, ['Alpha'])
             if not s:
@@ -849,7 +664,6 @@ def bake_selected_objects():
     orig_threads = scene.render.threads
     orig_margin_type = getattr(scene.render.bake, 'margin_type', None)
     orig_color_depth = scene.render.image_settings.color_depth
-    orig_filter_width = scene.cycles.filter_width
 
     # --- 3. APPLY EXACT LINEAR / STANDARD COLOR MANAGEMENT & LOW-RAM CYCLES SETTINGS ---
     scene.render.engine = 'CYCLES'
@@ -862,8 +676,6 @@ def bake_selected_objects():
     scene.cycles.use_auto_tile = True
     scene.cycles.tile_size = 512
     scene.cycles.max_bounces = 0
-    # Sharp filter_width prevents sub-pixel Voronoi flakes from blurring into grey mud!
-    scene.cycles.filter_width = 0.01
     scene.render.threads_mode = 'FIXED'
     scene.render.threads = MAX_CPU_THREADS
     
@@ -873,6 +685,8 @@ def bake_selected_objects():
     safe_pixel_margin = max(4, min(12, int((UV_ISLAND_MARGIN * IMAGE_SIZE) * 0.45)))
 
     # --- 4. ISOLATE SCENE & MAKE MATERIALS SINGLE-USER UPFRONT ---
+    # CRITICAL FIX FOR BUG #3 (Almirah Body vs Doors sharing material):
+    # Make every material single-user BEFORE any object modifies or cleans up nodes!
     for obj in selected_meshes:
         for slot in obj.material_slots:
             if slot.material and slot.material.users > 1:
@@ -921,7 +735,7 @@ def bake_selected_objects():
             has_ao_or_bevel = False
             active_materials = []
             mat_scalar_props = {}
-            mat_varying_channels = {}
+            mat_linked_channels = {}
 
             for slot in obj.material_slots:
                 mat = slot.material
@@ -931,15 +745,15 @@ def bake_selected_objects():
                         has_ao_or_bevel = True
                     
                     mat_scalar_props[mat] = capture_all_principled_scalars(mat.node_tree)
-                    mat_varying_channels[mat] = set()
+                    mat_linked_channels[mat] = set()
 
                     out_node = get_active_output(mat.node_tree.nodes)
                     if out_node and out_node.inputs['Surface'].is_linked:
                         surf_node = out_node.inputs['Surface'].links[0].from_node
                         handle_displacement_safe(mat.node_tree, out_node, surf_node)
                         for ch in CHANNELS_TO_BAKE:
-                            if is_channel_spatially_varying(mat.node_tree, surf_node, ch):
-                                mat_varying_channels[mat].add(ch)
+                            if is_channel_linked_recursive(mat.node_tree, surf_node, ch):
+                                mat_linked_channels[mat].add(ch)
 
             saved_filepaths = {mat: {} for mat in active_materials}
 
@@ -951,21 +765,20 @@ def bake_selected_objects():
                     if out_node and out_node.inputs['Surface'].is_linked:
                         surf_node = out_node.inputs['Surface'].links[0].from_node
                         if should_bake_channel_recursive(mat.node_tree, surf_node, channel):
-                            if (channel in mat_varying_channels[mat]) or SAVE_CONSTANT_MAPS_TO_DISK:
+                            if (channel in mat_linked_channels[mat]) or FORCE_BAKE_ALL_MAPS:
                                 mats_needing_channel.append(mat)
 
                 if not mats_needing_channel:
                     continue
 
-                # Use 1 correlated sample (`filter_width=0.01`) for BASE_COLOR, ROUGHNESS, and NORMAL
-                # so high-frequency Voronoi flakes (`Scale=5000` in Image 3) don't average into bright mud!
-                # Only use 4 samples when raytraced AO or Bevel nodes are present!
-                if channel == 'BASE_COLOR' and has_ao_or_bevel:
+                if channel == 'NORMAL':
+                    scene.cycles.samples = 8
+                elif channel == 'BASE_COLOR' and has_ao_or_bevel:
                     scene.cycles.samples = 4
                 else:
                     scene.cycles.samples = 1
 
-                print(f"[{obj.name}] Baking {channel} ({scene.cycles.samples} sample)...")
+                print(f"[{obj.name}] Baking {channel} ({scene.cycles.samples} samples)...")
                 pass_records = []
 
                 for mat_idx, mat in enumerate(active_materials):
@@ -980,14 +793,22 @@ def bake_selected_objects():
                     surf_node = orig_surf_socket.node
                     temp_cleanup_records = []
 
+                    # CRITICAL FIX FOR BUG #2 & #3 (Blender 63-character ID name truncation!):
+                    # Keep internal Blender image name under 50 chars so `_NORMAL` / `_ROUGHNESS` is NEVER cut off!
                     short_obj = sanitize_filename(obj.name, 22)
+                    short_mat = sanitize_filename(mat.name, 18)
                     internal_img_name = f"BK_{short_obj}_{mat_idx}_{channel}"
+                    
+                    # Full descriptive filename on disk (OS supports 255+ chars)
                     full_disk_filename = f"{sanitize_filename(obj.name, 60)}_{sanitize_filename(mat.name, 50)}_{channel}.png"
 
                     if internal_img_name in bpy.data.images:
                         bpy.data.images.remove(bpy.data.images[internal_img_name])
 
                     is_data = channel not in ['BASE_COLOR', 'EMISSION']
+                    # CRITICAL FIX FOR BUG #1 (Roughness & Metallic value accuracy):
+                    # Always use float_buffer=True for Non-Color data passes (Roughness, Metallic, Normal)
+                    # so Cycles writes linear floating-point values without sRGB gamma distortion!
                     use_float = is_data
                     bg_col = get_background_fill_color(channel, mat_scalar_props[mat])
 
@@ -1011,10 +832,7 @@ def bake_selected_objects():
                     bake_node.select = True
                     nodes.active = bake_node
 
-                    if channel == 'NORMAL':
-                        # Ensure Mix Shaders with Glossy BSDF in Socket 1 don't block the Principled BSDF's Bump map!
-                        prepare_normal_bake_override(nt, surf_node, temp_cleanup_records)
-                    else:
+                    if channel != 'NORMAL':
                         emit_shader_out = build_channel_emission_shader(nt, surf_node, channel, temp_cleanup_records)
                         if emit_shader_out:
                             links.new(emit_shader_out, out_node.inputs['Surface'])
@@ -1035,17 +853,13 @@ def bake_selected_objects():
                         filepath = os.path.join(SAVE_PATH, full_disk_filename)
                         img.filepath_raw = filepath
                         img.file_format = 'PNG'
-                        scene.render.image_settings.color_depth = '16' if is_data else '8'
+                        scene.render.image_settings.color_depth = '16' if channel == 'NORMAL' else '8'
                         img.save()
                         saved_filepaths[mat][channel] = (filepath, is_data)
 
                     for action, target_nt, item1, item2 in reversed(temp_cleanup_records):
                         if action == 'RESTORE_LINK':
                             target_nt.links.new(item1, item2)
-                        elif action == 'REMOVE_LINK':
-                            for l in list(target_nt.links):
-                                if l.from_socket == item1 and l.to_socket == item2:
-                                    target_nt.links.remove(l)
                         elif action == 'REMOVE_NODE':
                             try:
                                 target_nt.nodes.remove(item1)
@@ -1076,7 +890,6 @@ def bake_selected_objects():
                     links = nt.links
 
                     s_props = mat_scalar_props.get(mat, {})
-                    varying_chs = mat_varying_channels.get(mat, set())
 
                     nodes.clear()
 
@@ -1116,12 +929,6 @@ def bake_selected_objects():
                     cr_sock = get_socket(bsdf, ['Coat Roughness', 'Clearcoat Roughness'])
                     if cr_sock:
                         cr_sock.default_value = s_props.get('Coat Roughness', 0.03)
-                    cior_sock = get_socket(bsdf, ['Coat IOR'])
-                    if cior_sock:
-                        cior_sock.default_value = s_props.get('Coat IOR', 1.5)
-                    ctint_sock = get_socket(bsdf, ['Coat Tint'])
-                    if ctint_sock:
-                        ctint_sock.default_value = s_props.get('Coat Tint', (1.0, 1.0, 1.0, 1.0))
 
                     sw_sock = get_socket(bsdf, ['Sheen Weight', 'Sheen'])
                     if sw_sock:
@@ -1143,8 +950,9 @@ def bake_selected_objects():
                     uv_node.uv_map = "Bake_UV"
                     uv_node.location = (-800, 0)
 
-                    y_pos = 350
+                    y_pos = 300
                     for channel, (filepath, is_data) in saved_filepaths[mat].items():
+                        # Remove any stale cached image with the same filepath so Blender loads fresh from disk
                         for existing_img in list(bpy.data.images):
                             if existing_img.filepath_raw == filepath or existing_img.filepath == filepath:
                                 if existing_img.users == 0:
@@ -1160,36 +968,31 @@ def bake_selected_objects():
                         tex_node.location = (-500, y_pos)
                         links.new(uv_node.outputs['UV'], tex_node.inputs['Vector'])
 
-                        should_connect = (not ONLY_LINK_SPATIALLY_VARYING_MAPS) or (channel in varying_chs)
-
-                        if should_connect:
-                            if channel == 'BASE_COLOR':
-                                links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-                            elif channel == 'METALLIC':
-                                links.new(tex_node.outputs['Color'], bsdf.inputs['Metallic'])
-                            elif channel == 'ROUGHNESS':
-                                links.new(tex_node.outputs['Color'], bsdf.inputs['Roughness'])
-                            elif channel == 'COAT_WEIGHT' and cw_sock:
-                                links.new(tex_node.outputs['Color'], cw_sock)
-                            elif channel == 'COAT_ROUGHNESS' and cr_sock:
-                                links.new(tex_node.outputs['Color'], cr_sock)
-                            elif channel == 'TRANSMISSION' and trans_sock:
+                        if channel == 'BASE_COLOR':
+                            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+                        elif channel == 'METALLIC':
+                            links.new(tex_node.outputs['Color'], bsdf.inputs['Metallic'])
+                        elif channel == 'ROUGHNESS':
+                            links.new(tex_node.outputs['Color'], bsdf.inputs['Roughness'])
+                        elif channel == 'TRANSMISSION':
+                            if trans_sock:
                                 links.new(tex_node.outputs['Color'], trans_sock)
-                            elif channel == 'ALPHA':
-                                links.new(tex_node.outputs['Color'], bsdf.inputs['Alpha'])
-                            elif channel == 'SPECULAR' and spec_sock:
+                        elif channel == 'ALPHA':
+                            links.new(tex_node.outputs['Color'], bsdf.inputs['Alpha'])
+                        elif channel == 'SPECULAR':
+                            if spec_sock:
                                 links.new(tex_node.outputs['Color'], spec_sock)
-                            elif channel == 'EMISSION':
-                                if emit_sock:
-                                    links.new(tex_node.outputs['Color'], emit_sock)
-                                if str_sock and s_props.get('Emission Strength', 0.0) > 0.001:
-                                    str_sock.default_value = 1.0
-                            elif channel == 'NORMAL':
-                                norm_node = nodes.new('ShaderNodeNormalMap')
-                                norm_node.uv_map = "Bake_UV"
-                                norm_node.location = (-250, y_pos)
-                                links.new(tex_node.outputs['Color'], norm_node.inputs['Color'])
-                                links.new(norm_node.outputs['Normal'], bsdf.inputs['Normal'])
+                        elif channel == 'EMISSION':
+                            if emit_sock:
+                                links.new(tex_node.outputs['Color'], emit_sock)
+                            if str_sock and s_props.get('Emission Strength', 0.0) > 0.001:
+                                str_sock.default_value = 1.0
+                        elif channel == 'NORMAL':
+                            norm_node = nodes.new('ShaderNodeNormalMap')
+                            norm_node.uv_map = "Bake_UV"
+                            norm_node.location = (-250, y_pos)
+                            links.new(tex_node.outputs['Color'], norm_node.inputs['Color'])
+                            links.new(norm_node.outputs['Normal'], bsdf.inputs['Normal'])
 
                         y_pos -= 280
 
@@ -1217,7 +1020,6 @@ def bake_selected_objects():
         scene.cycles.use_auto_tile = orig_use_auto_tile
         scene.cycles.tile_size = orig_tile_size
         scene.cycles.max_bounces = orig_max_bounces
-        scene.cycles.filter_width = orig_filter_width
         scene.render.threads_mode = orig_threads_mode
         scene.render.threads = orig_threads
         scene.render.image_settings.color_depth = orig_color_depth
